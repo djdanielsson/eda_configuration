@@ -62,7 +62,7 @@ class EDAModule(AnsibleModule):
         "verify_ssl": "validate_certs",
         "request_timeout": "request_timeout",
     }
-    IDENTITY_FIELDS = {}
+    IDENTITY_FIELDS = {"users": "username"}
     ENCRYPTED_STRING = "$encrypted$"
     host = "127.0.0.1"
     username = None
@@ -88,8 +88,9 @@ class EDAModule(AnsibleModule):
 
         if direct_params is not None:
             self.params = direct_params
-        #        else:
-        super(EDAModule, self).__init__(argument_spec=full_argspec, **kwargs)
+        else:
+            super(EDAModule, self).__init__(argument_spec=full_argspec, **kwargs)
+
         self.session = Request(cookies=CookieJar(), validate_certs=self.verify_ssl, timeout=self.request_timeout)
 
         # Parameters specified on command line will override settings in any config
@@ -302,16 +303,32 @@ class EDAModule(AnsibleModule):
                 self.fail_wanted_one(response, endpoint, new_kwargs.get("data"))
         elif response["json"]["count"] > 1:
             if name_or_id:
-                # Since we did a name or ID search and got > 1 return something if the id matches
+                # Since we did a name or ID search and got > 1 return something if the id matches or the name matches exactly
+                exact_matches = []
                 for asset in response["json"]["results"]:
                     if str(asset["id"]) == name_or_id:
                         return self.existing_item_add_url(asset, endpoint, key=key)
+                    if str(asset[name_field]) == name_or_id:
+                        exact_matches.append(self.existing_item_add_url(asset, endpoint, key=key))
+                # If there is one exact name match then return that
+                if len(exact_matches) == 1:
+                    return exact_matches[0]
 
-            # We got > 1 and either didn't find something by ID (which means multiple names)
+            # We got > 1 and either didn't find something by ID or exact name (which means multiple names)
             # Or we weren't running with a or search and just got back too many to begin with.
-            self.fail_wanted_one(response, endpoint, new_kwargs.get("data"))
-
-        return self.existing_item_add_url(response["json"]["results"][0], endpoint, key=key)
+            if allow_none:
+                return None
+            else:
+                self.fail_wanted_one(response, endpoint, new_kwargs.get("data"))
+        else:
+            # Check if name actually matches and isn't just that we match part of the name
+            asset = response["json"]["results"][0]
+            if (str(asset["id"]) == name_or_id) or (str(asset[name_field]) == name_or_id):
+                return self.existing_item_add_url(response["json"]["results"][0], endpoint, key=key)
+            elif allow_none:
+                return None
+            else:
+                self.fail_wanted_one(response, endpoint, new_kwargs.get("data"))
 
     def get_by_id(self, endpoint, id, **kwargs):
         new_kwargs = kwargs.copy()
@@ -486,6 +503,7 @@ class EDAModule(AnsibleModule):
         auto_exit=True,
         item_type="unknown",
         associations=None,
+        treat_conflict_as_unchanged=False,
     ):
 
         # This will exit from the module on its own
@@ -523,9 +541,11 @@ class EDAModule(AnsibleModule):
                     self.json_output["id"] = response["json"]["id"]
                     item_url = "{0}{1}/".format(
                         self.build_url(endpoint).geturl()[len(self.host):],
-                        new_item["name"],
+                        response["json"]["id"],
                     )
                 self.json_output["changed"] = True
+            elif response["status_code"] in [409] and treat_conflict_as_unchanged:
+                self.json_output["changed"] = False
             else:
                 if "json" in response and "__all__" in response["json"]:
                     self.fail_json(msg="Unable to create {0} {1}: {2}".format(item_type, item_name, response["json"]["__all__"][0]))
@@ -618,7 +638,8 @@ class EDAModule(AnsibleModule):
             try:
                 item_url = fixed_url or existing_item[key]
                 item_type = existing_item["type"]
-                item_name = existing_item["name"]
+                name_field = self.get_name_field_from_endpoint(endpoint)
+                item_name = existing_item[name_field]
                 item_id = require_id and existing_item["id"]
             except KeyError as ke:
                 self.fail_json(msg="Unable to process update of item due to missing data {0}".format(ke))
@@ -759,8 +780,8 @@ class EDAModule(AnsibleModule):
     def get_exactly_one(self, endpoint, name_or_id=None, **kwargs):
         return self.get_one(endpoint, name_or_id=name_or_id, allow_none=False, **kwargs)
 
-    def resolve_name_to_id(self, endpoint, name_or_id, data={}):
-        return self.get_exactly_one(endpoint, name_or_id, **{"data": data})["id"]
+    def resolve_name_to_id(self, endpoint, name_or_id, data=None):
+        return self.get_exactly_one(endpoint, name_or_id, **{"data": data if data else {}})["id"]
 
     def objects_could_be_different(self, old, new, field_set=None, warning=False):
         if field_set is None:
@@ -769,10 +790,10 @@ class EDAModule(AnsibleModule):
             new_field = new.get(field, None)
             old_field = old.get(field, None)
             if old_field != new_field:
-                if self.update_secrets or (not self.fields_could_be_same(old_field, new_field)):
+                if self.update_secrets:
                     return True  # Something doesn't match, or something might not match
             elif self.has_encrypted_values(new_field) or field not in new:
-                if self.update_secrets or (not self.fields_could_be_same(old_field, new_field)):
+                if self.update_secrets:
                     # case of 'field not in new' - user password write-only field that API will not display
                     self._encrypted_changed_warning(field, old, warning=warning)
                     return True
@@ -783,21 +804,43 @@ class EDAModule(AnsibleModule):
 
         # If the state was present and we can let the module build or update the existing item, this will return on its own
         response = self.post_endpoint('projects/{id}/sync'.format(id=id))
-        task_id = response["json"]["import_task_id"]
-        self.json_output["task"] = task_id
 
-        if wait:
-            status = None
-            start = time.time()
-            elapsed = 0
-            while status != "finished" and status != "failed":
-                status = self.get_endpoint("tasks/{id}".format(id=task_id))["json"]["status"]
-                time.sleep(interval)
-                elapsed = time.time() - start
-                if timeout and elapsed > timeout:
-                    self.fail_json(msg="Timed out awaiting task completion.", task=task_id)
-            if status == "failed":
-                self.fail_json(msg="The project sync failed", task=task_id)
+        if response["status_code"] == 202:
+            if wait:
+                status = None
+                start = time.time()
+                elapsed = 0
+                while status != "completed" and status != "failed":
+                    project = self.get_endpoint('projects/{id}'.format(id=id))["json"]
+                    self.json_output["project"] = project
+                    status = project["import_state"]
+                    time.sleep(interval)
+                    elapsed = time.time() - start
+                    if timeout and elapsed > timeout:
+                        self.fail_json(msg="Timed out awaiting task completion.", project=project)
+                if status == "failed":
+                    self.fail_json(msg="The project sync failed", task=project["import_error"])
+        else:
+            if "json" in response and "__all__" in response["json"]:
+                if "detail" in response["json"]["__all__"][0] and response["json"]["__all__"][0]["detail"] == "Project import or sync is already running.":
+                    self.json_output["changed"] = False
+                    self.json_output["detail"] = response["json"]["__all__"][0]["detail"]
+                    self.exit_json(**self.json_output)
+                else:
+                    self.fail_json(msg="Unable to sync project: {0}".format(response["json"]["__all__"][0]))
+            elif "json" in response:
+                # This is from a project delete (if there is an active job against it)
+                if "error" in response["json"]:
+                    if "detail" in response["json"]["error"] and response["json"]["error"]["detail"] == "Project import or sync is already running.":
+                        self.json_output["changed"] = False
+                        self.json_output["detail"] = response["json"]["error"]["detail"]
+                        self.exit_json(**self.json_output)
+                    else:
+                        self.fail_json(msg="Unable to sync project: {0}".format(response["json"]["error"]))
+                else:
+                    self.fail_json(msg="Unable to sync project: {0}".format(response["json"]))
+            else:
+                self.fail_json(msg="Unable to sync project: {0}".format(response["status_code"]))
 
         self.json_output["changed"] = True
         self.exit_json(**self.json_output)
